@@ -2,6 +2,9 @@
  * Copyright 2012, Chris Wanstrath
  * Released under the MIT License
  * https://github.com/defunkt/jquery-pjax
+ * 
+ * This is modified verision pjax for multiple update
+ * 
  */
 
 (function($){
@@ -241,11 +244,11 @@ function pjax(options) {
   }
 
   options.error = function(xhr, textStatus, errorThrown) {
-    var container = extractContainer("", xhr, options)
+    var url = extractUrl( xhr, options);
 
     var allowed = fire('pjax:error', [xhr, textStatus, errorThrown, options])
     if (options.type == 'GET' && textStatus !== 'abort' && allowed) {
-      locationReplace(container.url)
+      locationReplace(url)
     }
   }
 
@@ -260,37 +263,37 @@ function pjax(options) {
 
     var latestVersion = xhr.getResponseHeader('X-PJAX-Version')
 
-    var container = extractContainer(data, xhr, options)
+    var containers = extractContainers(data, xhr, options)
 
-    var url = parseURL(container.url)
+    var url = extractUrl( xhr, options)
     if (hash) {
-      url.hash = hash
-      container.url = url.href
+        url.hash = hash
+        url = url.href
     }
 
     // If there is a layout version mismatch, hard load the new url
     if (currentVersion && latestVersion && currentVersion !== latestVersion) {
-      locationReplace(container.url)
-      return
+        locationReplace(url)
+        return
     }
 
     // If the new response is missing a body, hard load the page
-    if (!container.contents) {
-      locationReplace(container.url)
+    if (!containers.length) {
+      locationReplace(url)
       return
     }
 
     pjax.state = {
       id: options.id || uniqueId(),
-      url: container.url,
-      title: container.title,
+      url: url,
+      title: containers[0].title,
       container: context.selector,
       fragment: options.fragment,
       timeout: options.timeout
     }
 
     if (options.push || options.replace) {
-      window.history.replaceState(pjax.state, container.title, container.url)
+      window.history.replaceState(pjax.state, containers[0].title, containers[0].url)
     }
 
     // Only blur the focus if the focused element is within the container.
@@ -303,37 +306,48 @@ function pjax(options) {
       } catch (e) { }
     }
 
-    if (container.title) document.title = container.title
+    if (containers[0].title) document.title = containers[0].title;
 
-    fire('pjax:beforeReplace', [container.contents, options], {
-      state: pjax.state,
-      previousState: previousState
-    })
-    context.html(container.contents)
+    
+    // if only one fragment
+    if (containers.length===1){
+        var container=containers[0];
+        fire('pjax:beforeReplace', [container.contents, options], {
+            state: pjax.state,
+            previousState: previousState
+        });
+        context.html(container.contents);
+        // FF bug: Won't autofocus fields that are inserted via JS.
+        // This behavior is incorrect. So if theres no current focus, autofocus
+        // the last field.
+        //
+        // http://www.w3.org/html/wg/drafts/html/master/forms.html
+        var autofocusEl = context.find('input[autofocus], textarea[autofocus]').last()[0]
+        if (autofocusEl && document.activeElement !== autofocusEl) {
+          autofocusEl.focus();
+        }
+        executeScriptTags(container.scripts)
+        var scrollTo = options.scrollTo
 
-    // FF bug: Won't autofocus fields that are inserted via JS.
-    // This behavior is incorrect. So if theres no current focus, autofocus
-    // the last field.
-    //
-    // http://www.w3.org/html/wg/drafts/html/master/forms.html
-    var autofocusEl = context.find('input[autofocus], textarea[autofocus]').last()[0]
-    if (autofocusEl && document.activeElement !== autofocusEl) {
-      autofocusEl.focus();
+        // Ensure browser scrolls to the element referenced by the URL anchor
+        if (hash) {
+          var name = decodeURIComponent(hash.slice(1))
+          var target = document.getElementById(name) || document.getElementsByName(name)[0]
+          if (target) scrollTo = $(target).offset().top
+        }
+
+        if (typeof scrollTo == 'number') $(window).scrollTop(scrollTo)
+        
+    } else { // if many we dont set focus and scroll 
+        fire('pjax:beforeReplace', [containers, options], {
+            state: pjax.state,
+            previousState: previousState
+        });
+        $.each(containers,function(key,container){
+              $(container.selector,options.context).html(container.contents);
+        });
     }
-
-    executeScriptTags(container.scripts)
-
-    var scrollTo = options.scrollTo
-
-    // Ensure browser scrolls to the element referenced by the URL anchor
-    if (hash) {
-      var name = decodeURIComponent(hash.slice(1))
-      var target = document.getElementById(name) || document.getElementsByName(name)[0]
-      if (target) scrollTo = $(target).offset().top
-    }
-
-    if (typeof scrollTo == 'number') $(window).scrollTop(scrollTo)
-
+    
     fire('pjax:success', [data, status, xhr, options])
   }
 
@@ -676,6 +690,10 @@ function parseHTML(html) {
   return $.parseHTML(html, document, true)
 }
 
+function extractUrl(xhr,options){
+    var serverUrl = xhr.getResponseHeader('X-PJAX-URL')
+    return  serverUrl ? stripInternalParams(parseURL(serverUrl)) : options.requestUrl;
+}
 // Internal: Extracts container and metadata from response.
 //
 // 1. Extracts X-PJAX-URL header if set
@@ -686,70 +704,66 @@ function parseHTML(html) {
 // xhr     - XHR response
 // options - pjax options Object
 //
-// Returns an Object with url, title, and contents keys.
-function extractContainer(data, xhr, options) {
-  var obj = {}, fullDocument = /<html/i.test(data)
+// Returns an Objects[]
+function extractContainers(data, xhr, options) {
+  
+    var objs = [], fullDocument = /<html/i.test(data);
 
-  // Prefer X-PJAX-URL header if it was set, otherwise fallback to
-  // using the original requested url.
-  var serverUrl = xhr.getResponseHeader('X-PJAX-URL')
-  obj.url = serverUrl ? stripInternalParams(parseURL(serverUrl)) : options.requestUrl
-
-  // Attempt to parse response html into elements
-  if (fullDocument) {
-    var $head = $(parseHTML(data.match(/<head[^>]*>([\s\S.]*)<\/head>/i)[0]))
-    var $body = $(parseHTML(data.match(/<body[^>]*>([\s\S.]*)<\/body>/i)[0]))
-  } else {
-    var $head = $body = $(parseHTML(data))
-  }
-
-  // If response data is empty, return fast
-  if ($body.length === 0)
-    return obj
-
-  // If there's a <title> tag in the header, use it as
-  // the page's title.
-  obj.title = findAll($head, 'title').last().text()
-
-  if (options.fragment) {
-    // If they specified a fragment, look for it in the response
-    // and pull it out.
-    if (options.fragment === 'body') {
-      var $fragment = $body
+    
+    // Attempt to parse response html into elements
+    if (fullDocument) {
+      var $head = $(parseHTML(data.match(/<head[^>]*>([\s\S.]*)<\/head>/i)[0]))
+      var $body = $(parseHTML(data.match(/<body[^>]*>([\s\S.]*)<\/body>/i)[0]))
     } else {
-      var $fragment = findAll($body, options.fragment).first()
+      var $head = $body = $(parseHTML(data))
     }
 
-    if ($fragment.length) {
-      obj.contents = options.fragment === 'body' ? $fragment : $fragment.contents()
+    // If response data is empty, return fast
+    if ($body.length === 0) {
+      return []
+    }
+    
+    // collect fragments
+    if(options.fragment && options.fragment !== 'body'){
 
-      // If there's no title, look for data-title and title attributes
-      // on the fragment
-      if (!obj.title)
-        obj.title = $fragment.attr('title') || $fragment.data('title')
+          $.each(options.fragment.split(","),function(key,selector){
+              
+              $fragment=findAll($body, selector);
+               objs.push({
+                  selector:selector,
+                  title:  ($fragment.attr('title') || $fragment.data('title')),
+                  contents: $fragment.contents(),
+              });
+          });
+
+
+    } else {
+        objs.push({
+            title:findAll($head, 'title').last().text(),
+            contents:$body,
+        });
     }
 
-  } else if (!fullDocument) {
-    obj.contents = $body
-  }
+    //fragments clean up
+    $.each(objs,function(obj){ 
+        // Clean up any <title> tags
+        if (obj.contents) {
+          // Remove any parent title elements
+          obj.contents = $obj.contents.not(function() { return $(this).is('title') })
 
-  // Clean up any <title> tags
-  if (obj.contents) {
-    // Remove any parent title elements
-    obj.contents = obj.contents.not(function() { return $(this).is('title') })
+          // Then scrub any titles from their descendants
+          obj.contents.find('title').remove()
 
-    // Then scrub any titles from their descendants
-    obj.contents.find('title').remove()
+          // Gather all script[src] elements
+          obj.scripts = findAll(obj.contents, 'script[src]').remove()
+          obj.contents = obj.contents.not(obj.scripts)
+        }
 
-    // Gather all script[src] elements
-    obj.scripts = findAll(obj.contents, 'script[src]').remove()
-    obj.contents = obj.contents.not(obj.scripts)
-  }
-
-  // Trim any whitespace off the title
-  if (obj.title) obj.title = $.trim(obj.title)
-
-  return obj
+        // Trim any whitespace off the title
+        if (obj.title) obj.title = $.trim(obj.title)
+    });
+ 
+    return objs;
 }
 
 // Load an execute scripts using standard script request.
